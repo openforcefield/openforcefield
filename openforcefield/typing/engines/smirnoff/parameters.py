@@ -2317,35 +2317,34 @@ class ChargeIncrementModelHandler(ParameterHandler):
     _OPENMMTYPE = openmm.NonbondedForce  # OpenMM force class to create or utilize
     # TODO: The structure of this is still undecided
     _KWARGS = ['charge_from_molecules']
-    _DEFAULTS = {'number_of_conformers': 10,
-                 'quantum_chemical_method': 'AM1',
-                 'partial_charge_method': 'CM2'}
-    _ALLOWED_VALUES = {'quantum_chemical_method': ['AM1'],
-                       'partial_charge_method': ['CM2']}
+    _DEFAULT_SPEC_ATTRIBS = {'number_of_conformers': 1,
+                             'quantum_chemical_method': 'AM1',
+                             'partial_charge_method': 'Mulliken'}
+    _ATTRIBS_TO_TYPE = {'number_of_conformers': int}
 
 
 
     def __init__(self, **kwargs):
-        raise NotImplementedError("ChangeIncrementHandler is not yet implemented, pending finalization of the "
-                                  "SMIRNOFF spec")
-        # super().__init__(**kwargs)
-        #
-        # if number_of_conformers is None:
-        #     self._number_of_conformers = self._DEFAULTS['number_of_conformers']
-        # elif type(number_of_conformers) is str:
-        #     self._number_of_conformers = int(number_of_conformers)
-        # else:
-        #     self._number_of_conformers = number_of_conformers
-        #
-        # if quantum_chemical_method is None:
-        #     self._quantum_chemical_method = self._DEFAULTS['quantum_chemical_method']
-        # elif number_of_conformers in self._ALLOWED_VALUES['quantum_chemical_method']:
-        #     self._number_of_conformers = number_of_conformers
-        #
-        # if partial_charge_method is None:
-        #     self._partial_charge_method = self._DEFAULTS['partial_charge_method']
-        # elif partial_charge_method in self._ALLOWED_VALUES['partial_charge_method']:
-        #     self._partial_charge_method = partial_charge_method
+        #raise NotImplementedError("ChangeIncrementHandler is not yet implemented, pending finalization of the "
+        #                          "SMIRNOFF spec")
+        super().__init__(**kwargs)
+
+        #if number_of_conformers is None:
+        #    self._number_of_conformers = self._DEFAULTS['number_of_conformers']
+        #elif type(number_of_conformers) is str:
+        #    self._number_of_conformers = int(number_of_conformers)
+        #else:
+        #    self._number_of_conformers = number_of_conformers
+       # 
+       # if quantum_chemical_method is None:
+       #     self._quantum_chemical_method = self._DEFAULTS['quantum_chemical_method']
+       # elif number_of_conformers in self._ALLOWED_VALUES['quantum_chemical_method']:
+       #     self._number_of_conformers = number_of_conformers
+       # 
+       # if partial_charge_method is None:
+       #     self._partial_charge_method = self._DEFAULTS['partial_charge_method']
+       # elif partial_charge_method in self._ALLOWED_VALUES['partial_charge_method']:
+       #     self._partial_charge_method = partial_charge_method
 
 
 
@@ -2431,11 +2430,10 @@ class ChargeIncrementModelHandler(ParameterHandler):
                     topology_atom_map = mapping
                     break
                 # Set the partial charges
-                charge_mol_charges = charge_mol.get_partial_charges()
-                temp_mol_charges = charge_mol_charges.copy()
-                for charge_idx, ref_idx in topology_atom_map:
-                    temp_mol_charges[ref_idx] = charge_mol_charges[charge_idx]
-                molecule.set_partial_charges(temp_mol_charges)
+                temp_mol_charges = simtk.unit.Quantity(charge_mol.partial_charges)
+                for charge_idx, ref_idx in topology_atom_map.items():
+                    temp_mol_charges[ref_idx] = charge_mol.partial_charges[charge_idx]
+                molecule.partial_charges = temp_mol_charges
                 return True
 
         # If no match was found, return False
@@ -2444,6 +2442,7 @@ class ChargeIncrementModelHandler(ParameterHandler):
     def create_force(self, system, topology, **kwargs):
 
 
+        from openforcefield.utils.toolkits import GLOBAL_TOOLKIT_REGISTRY
         from openforcefield.topology import FrozenMolecule, TopologyAtom, TopologyVirtualSite
 
         existing = [system.getForce(i) for i in range(system.getNumForces())]
@@ -2461,23 +2460,35 @@ class ChargeIncrementModelHandler(ParameterHandler):
 
             # First, check whether any of the reference molecules in the topology are in the charge_from_mol list
             charges_from_charge_mol = False
-            if 'charge_from_mol' in kwargs:
-                charges_from_charge_mol = self.assign_charge_from_molecules(temp_mol, kwargs['charge_from_mol'])
+            if 'charge_from_molecules' in kwargs:
+                charges_from_charge_mol = self.assign_charge_from_molecules(temp_mol, kwargs['charge_from_molecules'])
 
             # If the molecule wasn't assigned parameters from a manually-input charge_mol, calculate them here
             if not(charges_from_charge_mol):
-                temp_mol.generate_conformers(n_conformers=10)
-                temp_mol.compute_partial_charges(quantum_chemical_method=self._quantum_chemical_method,
-                                                 partial_charge_method=self._partial_charge_method)
+                toolkit_registry = kwargs.get('toolkit_registry', GLOBAL_TOOLKIT_REGISTRY)
+                temp_mol.generate_conformers(n_conformers=self.number_of_conformers, toolkit_registry=toolkit_registry)
+                #temp_mol.compute_partial_charges(quantum_chemical_method=self._quantum_chemical_method,
+                #                                 partial_charge_method=self._partial_charge_method)
+                temp_mol.compute_partial_charges_am1(toolkit_registry=toolkit_registry)
 
             # Assign charges to relevant atoms
             for topology_molecule in topology._reference_molecule_to_topology_molecules[ref_mol]:
+
+                top_mol_particle_start_index = topology_molecule.particle_start_topology_index
+
                 for topology_particle in topology_molecule.particles:
-                    topology_particle_index = topology_particle.topology_particle_index
+
                     if type(topology_particle) is TopologyAtom:
                         ref_mol_particle_index = topology_particle.atom.molecule_particle_index
-                    if type(topology_particle) is TopologyVirtualSite:
+                        top_mol_particle_index = topology_molecule._ref_to_top_index[ref_mol_particle_index]
+                    elif type(topology_particle) is TopologyVirtualSite:
                         ref_mol_particle_index = topology_particle.virtual_site.molecule_particle_index
+                        top_mol_particle_index = ref_mol_particle_index
+                    else:
+                        raise ValueError(f'Particles of type {type(topology_particle)} are not supported')
+
+                    topology_particle_index = top_mol_particle_start_index + top_mol_particle_index
+
                     particle_charge = temp_mol._partial_charges[ref_mol_particle_index]
 
                     # Retrieve nonbonded parameters for reference atom (charge not set yet)
@@ -2486,6 +2497,8 @@ class ChargeIncrementModelHandler(ParameterHandler):
                     force.setParticleParameters(topology_particle_index,
                                                 particle_charge, sigma,
                                                 epsilon)
+
+        
 
 
 

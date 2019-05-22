@@ -1253,6 +1253,58 @@ class OpenEyeToolkitWrapper(ToolkitWrapper):
             )
         return charges
 
+
+
+    def compute_partial_charges_am1(self, molecule):
+        """
+        Compute AM1 partial charges with OpenEye quacpac
+
+        .. warning :: This API is experimental and subject to change.
+
+        Parameters
+        ----------
+        molecule : Molecule
+            Molecule for which partial charges are to be computed
+
+        Returns
+        -------
+        charges : numpy.array of shape (natoms) of type float
+            The partial charges
+
+        """
+        from openeye import oequacpac
+        import numpy as np
+
+        if molecule.n_conformers == 0:
+            raise Exception(
+                "No conformers present in molecule submitted for partial charge calculation. Consider "
+                "loading the molecule from a file with geometry already present or running "
+                "molecule.generate_conformers() before calling molecule.compute_partial_charges"
+            )
+        oemol = molecule.to_openeye()
+
+        result = oequacpac.OEAssignCharges(oemol, oequacpac.OEAM1Charges())
+
+        if result is False:
+            raise Exception('Unable to assign charges')
+
+        # Extract and return charges
+        ## TODO: Make sure atom mapping remains constant
+
+        charges = unit.Quantity(
+            np.zeros([oemol.NumAtoms()], np.float64), unit.elementary_charge)
+        for index, atom in enumerate(oemol.GetAtoms()):
+            charge = atom.GetPartialCharge()
+            charge = charge * unit.elementary_charge
+            charges[index] = charge
+
+        if ((charges / unit.elementary_charge) == 0.).all():
+            # TODO: These will be 0 if the charging failed. What behavior do we want in that case?
+            raise Exception(
+                "Partial charge calculation failed. Charges from compute_partial_charges() are all 0."
+            )
+        return charges
+
     def compute_wiberg_bond_orders(self, molecule, charge_model=None):
         """
         Update and store list of bond orders this molecule. Can be used for initialization of bondorders list, or
