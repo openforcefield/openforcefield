@@ -8,6 +8,9 @@ Chemical environments
 
 Tools for representing and operating on chemical environments
 
+    .. warning :: This class is largely redundant with the same one in the Chemper package, and will likely be removed.
+
+
 .. currentmodule:: openforcefield.typing.chemistry
 .. autosummary::
     :nosignatures:
@@ -40,7 +43,6 @@ For a basic example of system creation using a ``ForceField``, see ``examples/SM
     :toctree: api/generated/
 
     ForceField
-    get_available_force_fields
 
 Parameter Type
 ~~~~~~~~~~~~~~
