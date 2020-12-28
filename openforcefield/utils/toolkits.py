@@ -5046,9 +5046,11 @@ class ToolkitRegistry:
 
         Returns
         -------
-        toolkits : iterable of toolkit objects
+        toolkits : list[ToolkitWrapper]
+            List of ToolkitWrapper objects
+
         """
-        return list(self._toolkits)
+        return self._toolkits
 
     @property
     def registered_toolkit_versions(self):
