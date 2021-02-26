@@ -436,10 +436,11 @@ class Atom(Particle):
                     return True
         return False
 
-    @property
-    def is_in_ring(self):
+    def is_in_ring(self, toolkit_registry=GLOBAL_TOOLKIT_REGISTRY) -> bool:
         """
         Return whether or not this atom is in a ring(s) (of any size)
+
+        Currently only implemented via The RDKit, which must be installed.
 
         """
         if self._molecule is None:
@@ -447,7 +448,13 @@ class Atom(Particle):
                 "This Atom does not belong to a Molecule object"
             )
 
-        return any([self.molecule_atom_index in ring for ring in self._molecule.rings])
+        _is_in_ring = toolkit_registry.call(
+            "atom_is_in_ring",
+            self._molecule,
+            self.molecule_atom_index,
+        )
+
+        return _is_in_ring
 
     @property
     def virtual_sites(self):
@@ -1646,8 +1653,7 @@ class Bond(Serializable):
             raise ValueError("This Atom does not belong to a Molecule object")
         return self._molecule.bonds.index(self)
 
-    @property
-    def is_in_ring(self):
+    def is_in_ring(self, toolkit_registry=GLOBAL_TOOLKIT_REGISTRY) -> bool:
         """
         Return whether or not this bond is in a ring(s) (of any size)
 
@@ -1657,10 +1663,10 @@ class Bond(Serializable):
                 "This Bond does not belong to a Molecule object"
             )
 
-        for ring in self._molecule.rings:
-            if self.atom1.molecule_atom_index in ring:
-                if self.atom2.molecule_atom_index in ring:
-                    return True
+        if self.atom1.is_in_ring(toolkit_registry=toolkit_registry):
+            if self.atom2.is_in_ring(toolkit_registry=toolkit_registry):
+                return True
+
         return False
 
     def __repr__(self):
@@ -3031,7 +3037,6 @@ class FrozenMolecule(Serializable):
 
         self._cached_smiles = None
         # TODO: Clear fractional bond orders
-        self._rings = None
 
     def to_networkx(self):
         """Generate a NetworkX undirected graph from the Molecule.
@@ -3590,11 +3595,11 @@ class FrozenMolecule(Serializable):
         self._construct_torsions()
         return len(self._impropers)
 
-    @property
-    def n_rings(self):
-        """Return the number of rings found in the Molecule
+    def get_n_rings(self, toolkit_registry=GLOBAL_TOOLKIT_REGISTRY):
+        """Return the number of rings found in the Molecule as determined by
+        a cheminformatics toolkit
 
-        Requires the RDKit to be installed.
+        Currently only implemented via The RDKit, which must be installed.
 
         .. note ::
 
@@ -3604,7 +3609,24 @@ class FrozenMolecule(Serializable):
             (5+) rings or bicyclic moieties (i.e. norbornane).
 
         """
-        return len(self.rings)
+        if isinstance(toolkit_registry, ToolkitRegistry):
+            rings = toolkit_registry.call(
+                "find_rings",
+                molecule=self,
+            )
+        elif isinstance(toolkit_registry, ToolkitWrapper):
+            toolkit = toolkit_registry
+            rings = toolkit.find_rings(
+                molecule=self,
+            )
+        else:
+            raise InvalidToolkitRegistryError(
+                "Invalid toolkit_registry passed to from_smiles. Expected ToolkitRegistry or ToolkitWrapper. "
+                f"Got  {type(toolkit_registry)}"
+            )
+
+        n_rings = len(rings)
+        return n_rings
 
     @property
     def particles(self):
@@ -5231,11 +5253,11 @@ class FrozenMolecule(Serializable):
 
         raise NotBondedError("No bond between atom {} and {}".format(i, j))
 
-    @property
-    def rings(self):
-        """Return the number of rings in this molecule.
+    def get_rings(self, toolkit_registry=GLOBAL_TOOLKIT_REGISTRY):
+        """
+        Call out to ToolkitWrapper methods to find the rings in this molecule.
 
-        Requires the RDKit to be installed.
+        Currently only implemented via The RDKit, which must be installed.
 
         .. note ::
 
@@ -5243,28 +5265,6 @@ class FrozenMolecule(Serializable):
             function may not be well-behaved and may report a different number
             rings than expected. Some problematic cases include networks of many
             (5+) rings or bicyclic moieties (i.e. norbornane).
-
-        """
-        if self._rings is None:
-            self._get_rings()
-        return self._rings
-
-    @RDKitToolkitWrapper.requires_toolkit()
-    def _get_rings(self):
-        """
-        Call out to RDKitToolkitWrapper methods to find the rings in this molecule.
-
-        Requires the RDKit to be installed.
-
-        .. note ::
-
-            For systems containing some special cases of connected rings, this
-            function may not be well-behaved and may report a different number
-            rings than expected. Some problematic cases include networks of many
-            (5+) rings or bicyclic moieties (i.e. norbornane).
-
-        .. todo :: This could be refactored to use ToolkitWrapper.call() to flexibly
-            access other toolkits, if find_rings is implemented.
 
         Returns
         -------
@@ -5274,9 +5274,23 @@ class FrozenMolecule(Serializable):
             found, a single empty tuple is returned.
 
         """
-        toolkit = RDKitToolkitWrapper()
-        rings = toolkit.find_rings(self)
-        self._rings = rings
+        if isinstance(toolkit_registry, ToolkitRegistry):
+            rings = toolkit_registry.call(
+                "find_rings",
+                molecule=self,
+            )
+        elif isinstance(toolkit_registry, ToolkitWrapper):
+            toolkit = toolkit_registry
+            rings = toolkit.find_rings(
+                molecule=self,
+            )
+        else:
+            raise InvalidToolkitRegistryError(
+                "Invalid toolkit_registry passed to from_smiles. Expected ToolkitRegistry or ToolkitWrapper. "
+                f"Got  {type(toolkit_registry)}"
+            )
+
+        return rings
 
 
 class Molecule(FrozenMolecule):
