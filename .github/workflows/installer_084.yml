@@ -1,4 +1,4 @@
-name: Make single-file installers (0.8.4)
+name: 0.8.4 Single-file installers
 
 on:
   workflow_dispatch:
@@ -13,7 +13,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [macOS-latest, ubuntu-latest]
-        python-version: [3.7]
+        python-version: [3.6, 3.7]
 
     env:
       CI_OS: ${{ matrix.os }}
