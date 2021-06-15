@@ -36,21 +36,21 @@ Molecular chemical entity representation and routines to interface with cheminfo
 import operator
 import warnings
 from abc import abstractmethod
-from collections import OrderedDict
+from collections import OrderedDict, UserDict, defaultdict
 from copy import deepcopy
 from typing import Optional, Union
+from itertools import chain
 
+
+import json
 import networkx as nx
 import numpy as np
+from cached_property import cached_property
 from simtk import unit
 from simtk.openmm.app import Element, element
 
 import openff.toolkit
-from openff.toolkit.utils import (
-    MessageException,
-    quantity_to_string,
-    string_to_quantity,
-)
+from openff.toolkit.utils import quantity_to_string, string_to_quantity
 from openff.toolkit.utils.serialization import Serializable
 from openff.toolkit.utils.toolkits import (
     DEFAULT_AROMATICITY_MODEL,
@@ -62,11 +62,20 @@ from openff.toolkit.utils.toolkits import (
     ToolkitWrapper,
     UndefinedStereochemistryError,
 )
-from openff.toolkit.utils.utils import MissingDependencyError, requires_package
-
+from openff.toolkit.utils.utils import (
+    MessageException,
+    MissingDependencyError,
+    requires_package,
+    get_data_file_path,
+    remove_subsets_from_list,
+)
 
 class NotAttachedToMoleculeError(MessageException):
     """Exception for when a component does not belong to a Molecule object, but is queried"""
+
+
+class InvalidAtomMetadataError(MessageException):
+    """The program attempted to set atom metadata to an invalid type"""
 
 
 # =============================================================================================
@@ -153,6 +162,24 @@ class Particle(Serializable):
 # =============================================================================================
 
 
+class AtomMetadataDict(UserDict):
+    def __init__(self, *args, **kwargs):
+        self.data = {}
+        self.update(dict(*args, **kwargs))
+
+    def __setitem__(self, key, value):
+        if not isinstance(key, str):
+            raise InvalidAtomMetadataError(
+                f"Attempted to set atom metadata with a non-string key. (key: {key}"
+            )
+        if not isinstance(value, (str, int)):
+            raise InvalidAtomMetadataError(
+                f"Attempted to set atom metadata with a non-string or integer "
+                f"value. (value: {value})"
+            )
+        super().__setitem__(key, value)
+
+
 class Atom(Particle):
     """
     A particle representing a chemical atom.
@@ -179,6 +206,7 @@ class Atom(Particle):
         name=None,
         molecule=None,
         stereochemistry=None,
+        metadata=None,
     ):
         """
         Create an immutable Atom object.
@@ -201,6 +229,10 @@ class Atom(Particle):
             Either 'R' or 'S' for specified stereochemistry, or None for ambiguous stereochemistry
         name : str, optional, default=None
             An optional name to be associated with the atom
+        metadata : dict[str: (int, str)], default=None
+            An optional dictionary where keys are strings and values are strings or ints. This is intended
+            to record atom-level information used to inform hierarchy definition and iteration, such as
+            grouping atom by residue and chain.
 
         Examples
         --------
@@ -227,6 +259,10 @@ class Atom(Particle):
         # self._molecule_atom_index = molecule_atom_index
         self._bonds = list()
         self._virtual_sites = list()
+        if metadata is None:
+            self._metadata = AtomMetadataDict()
+        else:
+            self._metadata = AtomMetadataDict(metadata)
 
     # TODO: We can probably avoid an explicit call and determine this dynamically
     #   from self._molecule (maybe caching the result) to get rid of some bookkeeping.
@@ -265,6 +301,7 @@ class Atom(Particle):
         atom_dict["stereochemistry"] = self._stereochemistry
         # TODO: Should we let atoms have names?
         atom_dict["name"] = self._name
+        atom_dict["metadata"] = dict(self._metadata)
         # TODO: Should this be implicit in the atom ordering when saved?
         # atom_dict['molecule_atom_index'] = self._molecule_atom_index
         return atom_dict
@@ -272,9 +309,14 @@ class Atom(Particle):
     @classmethod
     def from_dict(cls, atom_dict):
         """Create an Atom from a dict representation."""
-        ## TODO: classmethod or static method? Classmethod is needed for Bond, so it have
-        ## its _molecule set and then look up the Atom on each side of it by ID
-        return cls.__init__(*atom_dict)
+        return cls(**atom_dict)
+
+    @property
+    def metadata(self):
+        """
+        The atom's metadata dictionary
+        """
+        return self._metadata
 
     @property
     def formal_charge(self):
@@ -463,7 +505,7 @@ class Atom(Particle):
         # for vsite in self._vsites:
         #    yield vsite
 
-    @property
+    @cached_property
     def molecule_atom_index(self):
         """
         The index of this Atom within the the list of atoms in ``Molecules``.
@@ -2480,6 +2522,20 @@ class FrozenMolecule(Serializable):
         """
         return hash(self.to_smiles())
 
+    # @cached_property
+    def ordered_connection_table_hash(self):
+        if self._ordered_connection_table_hash is not None:
+            return self._ordered_connection_table_hash
+
+        id = ""
+        for atom in self.atoms:
+            id += f"{atom.element.symbol}_{atom.formal_charge}_{atom.stereochemistry}__"
+        for bond in self.bonds:
+            id += f"{bond.bond_order}_{bond.stereochemistry}_{bond.atom1_index}_{bond.atom2_index}__"
+        # return hash(id)
+        self._ordered_connection_table_hash = hash(id)
+        return self._ordered_connection_table_hash
+
     @classmethod
     def from_dict(cls, molecule_dict):
         """
@@ -3528,6 +3584,10 @@ class FrozenMolecule(Serializable):
         self._cached_smiles = None
         # TODO: Clear fractional bond orders
         self._rings = None
+        self._ordered_connection_table_hash = None
+        for atom in self.atoms:
+            if "molecule_atom_index" in atom.__dict__:
+                del atom.__dict__["molecule_atom_index"]
 
     def to_networkx(self):
         """Generate a NetworkX undirected graph from the Molecule.
@@ -3657,7 +3717,13 @@ class FrozenMolecule(Serializable):
         return rotatable_bonds
 
     def _add_atom(
-        self, atomic_number, formal_charge, is_aromatic, stereochemistry=None, name=None
+        self,
+        atomic_number,
+        formal_charge,
+        is_aromatic,
+        stereochemistry=None,
+        name=None,
+        metadata=None,
     ):
         """
         Add an atom
@@ -3674,6 +3740,10 @@ class FrozenMolecule(Serializable):
             Either 'R' or 'S' for specified stereochemistry, or None if stereochemistry is irrelevant
         name : str, optional, default=None
             An optional name for the atom
+        metadata : dict[str: (int, str)], default=None
+            An optional dictionary where keys are strings and values are strings or ints. This is intended
+            to record atom-level information used to inform hierarchy definition and iteration, such as
+            grouping atom by residue and chain.
 
         Returns
         -------
@@ -3705,6 +3775,7 @@ class FrozenMolecule(Serializable):
             is_aromatic,
             stereochemistry=stereochemistry,
             name=name,
+            metadata=metadata,
             molecule=self,
         )
         self._atoms.append(atom)
@@ -5081,8 +5152,11 @@ class FrozenMolecule(Serializable):
         )
         return molecule
 
-    @RDKitToolkitWrapper.requires_toolkit()
-    def to_rdkit(self, aromaticity_model=DEFAULT_AROMATICITY_MODEL):
+    def to_rdkit(
+        self,
+        aromaticity_model=DEFAULT_AROMATICITY_MODEL,
+        toolkit_registry=GLOBAL_TOOLKIT_REGISTRY,
+    ):
         """
         Create an RDKit molecule
 
@@ -5109,8 +5183,13 @@ class FrozenMolecule(Serializable):
         >>> rdmol = molecule.to_rdkit()
 
         """
-        toolkit = RDKitToolkitWrapper()
-        return toolkit.to_rdkit(self, aromaticity_model=aromaticity_model)
+        # toolkit = RDKitToolkitWrapper()
+        if isinstance(toolkit_registry, ToolkitWrapper):
+            return toolkit_registry.to_rdkit(self, aromaticity_model=aromaticity_model)
+        else:
+            return toolkit_registry.call(
+                "to_rdkit", self, aromaticity_model=aromaticity_model
+            )
 
     @classmethod
     @OpenEyeToolkitWrapper.requires_toolkit()
@@ -5619,8 +5698,11 @@ class FrozenMolecule(Serializable):
 
         return new_molecule
 
-    @OpenEyeToolkitWrapper.requires_toolkit()
-    def to_openeye(self, aromaticity_model=DEFAULT_AROMATICITY_MODEL):
+    def to_openeye(
+        self,
+        toolkit_registry=GLOBAL_TOOLKIT_REGISTRY,
+        aromaticity_model=DEFAULT_AROMATICITY_MODEL,
+    ):
         """
         Create an OpenEye molecule
 
@@ -5650,8 +5732,15 @@ class FrozenMolecule(Serializable):
         >>> oemol = molecule.to_openeye()
 
         """
-        toolkit = OpenEyeToolkitWrapper()
-        return toolkit.to_openeye(self, aromaticity_model=aromaticity_model)
+        # toolkit = OpenEyeToolkitWrapper()
+        if isinstance(toolkit_registry, ToolkitWrapper):
+            return toolkit_registry.to_openeye(
+                self, aromaticity_model=aromaticity_model
+            )
+        else:
+            return toolkit_registry.call(
+                "to_openeye", self, aromaticity_model=aromaticity_model
+            )
 
     def _construct_angles(self):
         """
@@ -5957,7 +6046,13 @@ class Molecule(FrozenMolecule):
 
     # TODO: Change this to add_atom(Atom) to improve encapsulation and extensibility?
     def add_atom(
-        self, atomic_number, formal_charge, is_aromatic, stereochemistry=None, name=None
+        self,
+        atomic_number,
+        formal_charge,
+        is_aromatic,
+        stereochemistry=None,
+        name=None,
+        metadata=None,
     ):
         """
         Add an atom
@@ -5974,6 +6069,10 @@ class Molecule(FrozenMolecule):
             Either ``'R'`` or ``'S'`` for specified stereochemistry, or ``None`` if stereochemistry is irrelevant
         name : str, optional
             An optional name for the atom
+        metadata : dict[str: (int, str)], default=None
+            An optional dictionary where keys are strings and values are strings or ints. This is intended
+            to record atom-level information used to inform hierarchy definition and iteration, such as
+            grouping atom by residue and chain.
 
         Returns
         -------
@@ -6004,6 +6103,7 @@ class Molecule(FrozenMolecule):
             is_aromatic,
             stereochemistry=stereochemistry,
             name=name,
+            metadata=metadata,
         )
         return atom_index
 
@@ -6339,6 +6439,55 @@ class Molecule(FrozenMolecule):
                 return Image(png)
 
         raise ValueError("Could not find an appropriate backend")
+
+    def perceive_residues(self):
+        """
+        Perceive residue substructure and fill atoms metadata accordingly.
+        """
+        # Read substructure dictionary file
+        substructure_file_path = get_data_file_path('proteins/aa_residues_substructures.json')
+        with open(substructure_file_path, 'r') as subfile:
+            substructure_dictionary = json.load(subfile)
+        all_matches = list()
+        for residue_name, smarts_dict in substructure_dictionary.items():
+            matches = dict()
+            for smarts in smarts_dict:
+                for match in self.chemical_environment_matches(smarts):
+                    matches[match] = smarts
+                    all_matches.append({'atom_idxs': match,
+                                        'atom_idxs_set': set(match),
+                                        'smarts': smarts,
+                                        'residue_name': residue_name,
+                                        'atom_names': smarts_dict[smarts]})
+
+        # Remove matches that are subsets of other matches
+        # give precedence to the SMARTS defined at the end of the file
+        match_idxs_to_delete = set()
+        for match_idx in range(len(all_matches)-1, 0, -1):
+            this_match_set = all_matches[match_idx]['atom_idxs_set']
+            this_match_set_size = len(this_match_set)
+            for match_before_this_idx in range(match_idx):
+                match_before_this_set = all_matches[match_before_this_idx]['atom_idxs_set']
+                match_before_this_set_size = len(match_before_this_set)
+                n_overlapping_atoms = len(this_match_set.intersection(match_before_this_set))
+                if n_overlapping_atoms > 0:
+                    if match_before_this_set_size < this_match_set_size:
+                        match_idxs_to_delete.add(match_before_this_idx)
+                    else:
+                        match_idxs_to_delete.add(match_idx)
+
+        match_idxs_to_delete_list = sorted(list(match_idxs_to_delete), reverse=True)
+        for match_idx in match_idxs_to_delete_list:
+            all_matches.pop(match_idx)
+
+        all_matches.sort(key=lambda x: min(x['atom_idxs']))
+
+        # Now the matches have been deduplicated and de-subsetted
+        for residue_num, match_dict in enumerate(all_matches):
+            for smarts_idx, atom_idx in enumerate(match_dict['atom_idxs']):
+                self.atoms[atom_idx].metadata['residue_name'] = match_dict['residue_name']
+                self.atoms[atom_idx].metadata['residue_number'] = residue_num + 1
+                self.atoms[atom_idx].metadata['atom_name'] = match_dict['atom_names'][smarts_idx]
 
     def _ipython_display_(self):
         from IPython.display import display
