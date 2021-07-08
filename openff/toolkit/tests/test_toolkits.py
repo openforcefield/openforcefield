@@ -12,8 +12,12 @@ Tests for cheminformatics toolkit wrappers
 # =============================================================================================
 # GLOBAL IMPORTS
 # =============================================================================================
+
+import io
 import logging
 import os
+import pathlib
+import re
 from tempfile import NamedTemporaryFile
 from typing import Dict
 
@@ -59,32 +63,93 @@ from openff.toolkit.utils.toolkits import (
 # =============================================================================================
 
 
-def get_mini_drug_bank(toolkit_class, xfail_mols=None):
-    """Read the mini drug bank sdf file with the toolkit and return the molecules"""
+# During import stage, read the SD records in memory but don't process
+# them. When requested (via .get_molecule(toolkit)) use the given
+# toolkit to parse the record and return a new molecule.
 
-    # This is a work around a weird error where even though the test is skipped due to a missing toolkit
-    #  we still try and read the file with the toolkit
-    if toolkit_class.is_available():
-        toolkit = toolkit_class()
-        molecules = Molecule.from_file(
-            get_data_file_path("molecules/MiniDrugBank.sdf"),
-            "sdf",
-            toolkit_registry=toolkit,
-            allow_undefined_stereo=True,
-        )
-    else:
-        molecules = []
+# NOTE: this differs somewhat from the SDF reader in test_molecule.py:
+#   - This reads an .sdf file, not a .mol2
+#   - get_molecule() takes a toolkit wrapper and re-parses the
+#       record for each call.
 
-    if xfail_mols is None:
-        return molecules
 
-    for i, mol in enumerate(molecules):
-        if mol.name in xfail_mols:
-            marker = pytest.mark.xfail(reason=xfail_mols[mol.name])
-            molecules[i] = pytest.param(mol, marks=marker)
+class DrugBankRecord:
+    def __init__(self, name: str, record: bytes):
+        self.name = name
+        self.record = record
 
-    return molecules
+    def get_molecule(self, toolkit):
+        with NamedTemporaryFile(mode="w+b", suffix=".sdf") as tmpfile:
+            tmpfile.write(self.record)
+            tmpfile.flush()
+            molecules = toolkit.from_file(
+                tmpfile.name,
+                "sdf",
+                allow_undefined_stereo=True,
+            )
+        assert len(molecules) == 1, self.name
+        return molecules[0]
 
+
+# Split the file up into records. The search for "$$$$" is too simple
+# for a general-purpose reader, but all this needs to do is handle
+# MiniDrugBank.sdf.
+
+
+def load_mini_drug_bank():
+    content = pathlib.Path(
+        get_data_file_path("molecules/MiniDrugBank.sdf")
+    ).read_bytes()
+    table = {}
+
+    sep = b"\n$$$$\n"
+    assert content.endswith(sep)
+
+    for record in content.split(sep):
+        if not record:
+            # Ignore the final record
+            continue
+        # The first line (the title line) is the record name.
+        name = record.partition(b"\n")[0].strip().decode("utf8")
+        record += sep
+        table[name] = DrugBankRecord(name, record)
+
+    return table
+
+
+# Map name -> DrugBankRecord
+mini_drug_bank_table = load_mini_drug_bank()
+
+# Return DrugBankRecords by name
+def get_mini_drug_bank(names):
+    return [mini_drug_bank_table[name] for name in names]
+
+
+# These tables are for the entire DrugBank set, though we only test a subset.
+
+rdkit_parse_failures = set(
+    [
+        "DrugBank_2799",
+        "DrugBank_5415",
+        "DrugBank_3046",
+        "DrugBank_472",
+        "DrugBank_794",
+        "DrugBank_3655",
+        "DrugBank_3739",
+        "DrugBank_6353",
+        "DrugBank_1570",
+        "DrugBank_1594",
+        "DrugBank_1659",
+        "DrugBank_1661",
+        "DrugBank_4346",
+        "DrugBank_1802",
+        "DrugBank_6947",
+        "DrugBank_7049",
+        "DrugBank_4865",
+        "DrugBank_2465",
+        "DrugBank_2467",
+    ]
+)
 
 openeye_inchi_stereochemistry_lost = [
     "DrugBank_2799",
@@ -648,19 +713,50 @@ class TestOpenEyeToolkitWrapper:
         off_molecule = Molecule.from_openeye(oemol)
         assert off_molecule.properties["atom_map"] == expected_map
 
-    @pytest.mark.parametrize("molecule", get_mini_drug_bank(OpenEyeToolkitWrapper))
-    def test_to_inchi(self, molecule):
-        """Test conversion to standard and non-standard InChI"""
-
+    @pytest.mark.parametrize(
+        "record",
+        get_mini_drug_bank(
+            [
+                "DrugBank_2824",
+                "DrugBank_246",
+                "DrugBank_320",
+                "DrugBank_5804",
+                "DrugBank_794",
+                "DrugBank_3565",
+                "DrugBank_977",
+                "DrugBank_4161",
+                "DrugBank_6531",
+                "DrugBank_1564",
+                "DrugBank_1700",
+                "DrugBank_4346",
+                "DrugBank_4580",
+                "DrugBank_4662",
+                "DrugBank_7108",
+                "DrugBank_7124",
+                "DrugBank_2237",
+            ]
+        ),
+    )
+    def test_mini_drugbank_to_openeye(self, record):
         toolkit = OpenEyeToolkitWrapper()
+        molecule = record.get_molecule(toolkit)
+        oemol = molecule.to_openeye()
+        assert oemol.GetTitle() == record.name
+
+    @pytest.mark.parametrize("record", get_mini_drug_bank(["DrugBank_5373"]))
+    def test_to_inchi(self, record):
+        """Test conversion to standard and non-standard InChI"""
+        toolkit = OpenEyeToolkitWrapper()
+        molecule = record.get_molecule(toolkit)
         inchi = molecule.to_inchi(toolkit_registry=toolkit)
         non_standard = molecule.to_inchi(True, toolkit_registry=toolkit)
 
-    @pytest.mark.parametrize("molecule", get_mini_drug_bank(OpenEyeToolkitWrapper))
-    def test_to_inchikey(self, molecule):
+    @pytest.mark.parametrize("record", get_mini_drug_bank(["DrugBank_5373"]))
+    def test_to_inchikey(self, record):
         """Test the conversion to standard and non-standard InChIKey"""
 
         toolkit = OpenEyeToolkitWrapper()
+        molecule = record.get_molecule(toolkit)
         inchikey = molecule.to_inchikey(toolkit_registry=toolkit)
         non_standard_key = molecule.to_inchikey(True, toolkit_registry=toolkit)
 
@@ -672,14 +768,42 @@ class TestOpenEyeToolkitWrapper:
         with pytest.raises(RuntimeError):
             mol = Molecule.from_inchi(inchi, toolkit_registry=toolkit)
 
-    @pytest.mark.parametrize("molecule", get_mini_drug_bank(OpenEyeToolkitWrapper))
-    def test_non_standard_inchi_round_trip(self, molecule):
+    @pytest.mark.parametrize(
+        "record",
+        get_mini_drug_bank(
+            [
+                "DrugBank_5418",
+                "DrugBank_2991",
+                "DrugBank_416",
+                "DrugBank_423",
+                "DrugBank_443",
+                "DrugBank_5804",
+                "DrugBank_5847",
+                "DrugBank_3461",
+                "DrugBank_3565",
+                "DrugBank_6182",
+                "DrugBank_1538",
+                "DrugBank_1659",
+                "DrugBank_4346",
+                "DrugBank_4580",
+                "DrugBank_4586",
+                "DrugBank_7108",
+                "DrugBank_2186",
+                "DrugBank_2237",
+                "DrugBank_2429",
+                "DrugBank_2684",
+                "DrugBank_2728",
+            ]
+        ),
+    )
+    def test_non_standard_inchi_round_trip(self, record):
         """Test if a molecule can survive an InChi round trip test in some cases the standard InChI
         will not enough to ensure information is preserved so we test the non-standard inchi here."""
 
         from openff.toolkit.utils.toolkits import UndefinedStereochemistryError
 
         toolkit = OpenEyeToolkitWrapper()
+        molecule = record.get_molecule(toolkit)
         inchi = molecule.to_inchi(fixed_hydrogens=True, toolkit_registry=toolkit)
         # make a copy of the molecule from the inchi string
         if molecule.name in openeye_inchi_stereochemistry_lost:
@@ -705,33 +829,40 @@ class TestOpenEyeToolkitWrapper:
                 )
 
     @pytest.mark.parametrize(
-        "molecule",
+        "record",
         get_mini_drug_bank(
-            OpenEyeToolkitWrapper,
-            xfail_mols={
-                "DrugBank_2397": 'OpenEye cannot generate a correct IUPAC name and raises a "Warning: Incorrect name:" or simply return "BLAH".',
-                "DrugBank_2543": 'OpenEye cannot generate a correct IUPAC name and raises a "Warning: Incorrect name:" or simply return "BLAH".',
-                "DrugBank_2642": 'OpenEye cannot generate a correct IUPAC name and raises a "Warning: Incorrect name:" or simply return "BLAH".',
-                "DrugBank_1212": "the roundtrip generates molecules with very different IUPAC/SMILES!",
-                "DrugBank_2210": "the roundtrip generates molecules with very different IUPAC/SMILES!",
-                "DrugBank_4584": "the roundtrip generates molecules with very different IUPAC/SMILES!",
-                "DrugBank_390": 'raises warning "Unable to make OFFMol from OEMol: OEMol has unspecified stereochemistry."',
-                "DrugBank_810": 'raises warning "Unable to make OFFMol from OEMol: OEMol has unspecified stereochemistry."',
-                "DrugBank_4316": 'raises warning "Unable to make OFFMol from OEMol: OEMol has unspecified stereochemistry."',
-                "DrugBank_7124": 'raises warning "Unable to make OFFMol from OEMol: OEMol has unspecified stereochemistry."',
-                "DrugBank_3739": 'raises warning "Failed to parse name:"',
-                "DrugBank_4346": 'raises warning "Failed to parse name:"',
-                "DrugBank_5415": 'raises warning "Failed to parse name:"',
-                "DrugBank_1661": "fails roundtrip test",
-                "DrugBank_6353": "fails roundtrip test",
-                "DrugBank_2799": "from_iupac fails to read what to_iupac returns",
-                "DrugBank_4865": "from_iupac fails to read what to_iupac returns",
-                "DrugBank_2465": "from_iupac fails to read what to_iupac returns",
-            },
+            [
+                "DrugBank_5414",
+                "DrugBank_5449",
+                "DrugBank_246",
+                "DrugBank_390",
+                "DrugBank_416",
+                "DrugBank_423",
+                "DrugBank_443",
+                "DrugBank_5737",
+                "DrugBank_3358",
+                "DrugBank_3565",
+                "DrugBank_6032",
+                "DrugBank_977",
+                "DrugBank_3817",
+                "DrugBank_6295",
+                "DrugBank_6355",
+                "DrugBank_4316",
+                "DrugBank_1722",
+                "DrugBank_4545",
+                "DrugBank_4586",
+                "DrugBank_7108",
+                "DrugBank_7124",
+                "DrugBank_2429",
+                "DrugBank_2728",
+            ]
         ),
     )
-    def test_iupac_round_trip(self, molecule):
+    def test_iupac_round_trip(self, record):
         """Test round-trips with IUPAC names"""
+        toolkit = OpenEyeToolkitWrapper()
+        molecule = record.get_molecule(toolkit)
+
         undefined_stereo = molecule.name in openeye_iupac_bad_stereo
 
         iupac = molecule.to_iupac()
@@ -1823,19 +1954,62 @@ class TestRDKitToolkitWrapper:
         )
         assert offmol.n_atoms == 4
 
-    @pytest.mark.parametrize("molecule", get_mini_drug_bank(RDKitToolkitWrapper))
-    def test_to_inchi(self, molecule):
+    @pytest.mark.parametrize(
+        "record",
+        get_mini_drug_bank(
+            [
+                "DrugBank_2800",
+                "DrugBank_5414",
+                "DrugBank_5449",
+                "DrugBank_2987",
+                "DrugBank_3028",
+                "DrugBank_3046",
+                "DrugBank_390",
+                "DrugBank_3358",
+                "DrugBank_5900",
+                "DrugBank_3479",
+                "DrugBank_6103",
+                "DrugBank_3913",
+                "DrugBank_1538",
+                "DrugBank_4188",
+                "DrugBank_6775",
+                "DrugBank_6865",
+                "DrugBank_4580",
+                "DrugBank_7108",
+                "DrugBank_7124",
+                "DrugBank_2095",
+                "DrugBank_2178",
+                "DrugBank_2570",
+                "DrugBank_2585",
+                "DrugBank_2684",
+            ]
+        ),
+    )
+    def test_mini_drugbank_to_rdkit(self, record):
+        toolkit = RDKitToolkitWrapper()
+        if record.name in rdkit_parse_failures:
+            with pytest.raises(AssertionError, match=re.escape(record.name)):
+                molecule = record.get_molecule(toolkit)
+        else:
+            molecule = record.get_molecule(toolkit)
+            rdmol = molecule.to_rdkit()
+            assert rdmol.GetProp("_Name"), record.name
+
+    @pytest.mark.parametrize("record", get_mini_drug_bank(["DrugBank_5373"]))
+    def test_to_inchi(self, record):
         """Test conversion to standard and non-standard InChI"""
 
         toolkit = RDKitToolkitWrapper()
+        molecule = record.get_molecule(toolkit)
         inchi = molecule.to_inchi(toolkit_registry=toolkit)
         non_standard = molecule.to_inchi(fixed_hydrogens=True, toolkit_registry=toolkit)
 
-    @pytest.mark.parametrize("molecule", get_mini_drug_bank(RDKitToolkitWrapper))
-    def test_to_inchikey(self, molecule):
+    @pytest.mark.parametrize("record", get_mini_drug_bank(["DrugBank_5373"]))
+    def test_to_inchikey(self, record):
         """Test the conversion to standard and non-standard InChIKey"""
 
         toolkit = RDKitToolkitWrapper()
+        molecule = record.get_molecule(toolkit)
         inchikey = molecule.to_inchikey(toolkit_registry=toolkit)
         non_standard_key = molecule.to_inchikey(
             fixed_hydrogens=True, toolkit_registry=toolkit
@@ -1905,14 +2079,49 @@ class TestRDKitToolkitWrapper:
 
         compare_mols(ref_mol, nonstandard_inchi_mol)
 
-    @pytest.mark.parametrize("molecule", get_mini_drug_bank(RDKitToolkitWrapper))
-    def test_non_standard_inchi_round_trip(self, molecule):
+    @pytest.mark.parametrize(
+        "record",
+        get_mini_drug_bank(
+            [
+                "DrugBank_104",
+                "DrugBank_5514",
+                "DrugBank_416",
+                "DrugBank_423",
+                "DrugBank_443",
+                "DrugBank_5737",
+                "DrugBank_5804",
+                "DrugBank_3358",
+                "DrugBank_3461",
+                "DrugBank_3565",
+                "DrugBank_6103",
+                "DrugBank_3817",
+                "DrugBank_1391",
+                "DrugBank_1480",
+                "DrugBank_1538",
+                "DrugBank_6533",
+                "DrugBank_4322",
+                "DrugBank_4323",
+                "DrugBank_1742",
+                "DrugBank_1928",
+                "DrugBank_4580",
+                "DrugBank_4586",
+                "DrugBank_7108",
+                "DrugBank_2095",
+                "DrugBank_2429",
+                "DrugBank_2563",
+                "DrugBank_2684",
+                "DrugBank_2728",
+            ]
+        ),
+    )
+    def test_non_standard_inchi_round_trip(self, record):
         """Test if a molecule can survive an InChi round trip test in some cases the standard InChI
         will not be enough to ensure information is preserved so we test the non-standard inchi here."""
 
         from openff.toolkit.utils.toolkits import UndefinedStereochemistryError
 
         toolkit = RDKitToolkitWrapper()
+        molecule = record.get_molecule(toolkit)
         inchi = molecule.to_inchi(fixed_hydrogens=True, toolkit_registry=toolkit)
         # make a copy of the molecule from the inchi string
         if molecule.name in rdkit_inchi_stereochemistry_lost:
@@ -3279,7 +3488,7 @@ class TestAmberToolsToolkitWrapper:
         with_oe = [b.fractional_bond_order for b in mol.bonds]
         GLOBAL_TOOLKIT_REGISTRY.deregister_toolkit(OpenEyeToolkitWrapper)
         AmberToolsToolkitWrapper().assign_fractional_bond_orders(mol)
-        without_oe = [b.fractional_bond_order for b in mol.bonds]
+        without_oe = [pytest.approx(b.fractional_bond_order) for b in mol.bonds]
         GLOBAL_TOOLKIT_REGISTRY.register_toolkit(OpenEyeToolkitWrapper)
 
         assert with_oe == without_oe
